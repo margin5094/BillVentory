@@ -1,0 +1,1199 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  MyBucketName:
+    Description: S3 Bucket Name
+    Type: String
+    Default: pdffile-extract
+
+Resources:
+  pdfTextract:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const textract = new AWS.Textract();
+          const s3 = new AWS.S3();
+
+          AWS.config.update({
+            region: "us-east-1",
+          });
+
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          function convert_table_to_array(table_content) {
+            const header_row = table_content.slice(0, 6);
+            const product_rows = [];
+            for (let i = 6; i < table_content.length; i += 6) {
+              product_rows.push(table_content.slice(i, i + 6));
+            }
+
+            const products = product_rows.map((row) => {
+              const product = {};
+              row.forEach((cell_text, idx) => {
+                product[header_row[idx]] = cell_text;
+              });
+              return product;
+            });
+
+            return { products };
+          }
+
+          async function handler(event, context) {
+            try {
+              if ("Records" in event) {
+                const file_obj = event["Records"][0];
+                const bucketname = file_obj["s3"]["bucket"]["name"];
+                const filename = decodeURIComponent(
+                  file_obj["s3"]["object"]["key"].replace(/\+/g, " ")
+                );
+
+                console.log(`Bucket: ${bucketname} ::: Key: ${filename}`);
+
+                const response = await textract
+                  .detectDocumentText({
+                    Document: {
+                      S3Object: {
+                        Bucket: bucketname,
+                        Name: filename,
+                      },
+                    },
+                  })
+                  .promise();
+
+                //console.log(JSON.stringify(response));
+
+                const raw_text = [];
+                for (const block of response["Blocks"]) {
+                  if (block["BlockType"] === "LINE") {
+                    raw_text.push(block["Text"]);
+                  }
+                }
+
+                const result = convert_table_to_array(raw_text);
+                const requestBody = JSON.stringify(result);
+                const requestBodyObject = JSON.parse(requestBody);
+                const products = requestBodyObject.products;
+                console.log(products);
+                const putPromises = products.map((product) => {
+                  const params = {
+                    TableName: "products",
+                    Item: product,
+                  };
+
+                  return dynamodb.put(params).promise();
+                });
+
+                await Promise.all(putPromises);
+              }
+            } catch (error) {
+              console.error(error);
+            }
+
+            return {
+              statusCode: 500,
+              body: JSON.stringify("Error processing the document!"),
+            };
+          }
+
+          exports.handler = handler;
+
+      Handler: index.handler
+      Role: arn:aws:iam::723056485403:role/LabRole
+      Runtime: nodejs16.x
+      Timeout: 30
+
+  pdfupload:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const s3 = new AWS.S3();
+
+          exports.handler = async (event, context) => {
+            try {
+              const { pdfData, fileName } = JSON.parse(event.body);
+
+              if (!pdfData || !fileName) {
+                throw new Error(
+                  "Both pdfData and fileName must be provided in the request body."
+                );
+              }
+
+              const contentType = "application/pdf"; 
+              const bucketName = "pdffile-extract";
+              const pdfDataBuffer = Buffer.from(pdfData, "base64");
+
+              const params = {
+                Bucket: bucketName,
+                Key: fileName,
+                Body: pdfDataBuffer,
+                ContentType: contentType,
+              };
+
+              await s3.putObject(params).promise();
+
+              const responseHeaders = {
+                "Access-Control-Allow-Origin": "*", 
+                "Content-Type": "application/json", 
+              };
+
+              return {
+                statusCode: 200,
+                headers: responseHeaders,
+                body: JSON.stringify({ message: "File uploaded successfully!" }),
+              };
+            } catch (error) {
+              return {
+                statusCode: 500,
+                headers: { "Access-Control-Allow-Origin": "*" },
+                body: JSON.stringify({ error: `Error: ${error.message}` }),
+              };
+            }
+          };
+      Handler: index.handler
+      Role: arn:aws:iam::723056485403:role/LabRole
+      Runtime: nodejs16.x
+      Timeout: 30
+
+  AddProduct:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AddProduct
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Timeout: 30
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+          const AWS = require("aws-sdk");
+
+          AWS.config.update({
+            region: "us-east-1",
+          });
+
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          try {
+            const requestBody = JSON.parse(event.body);
+            const products = requestBody.products;
+
+            const putPromises = products.map((product) => {
+              const params = {
+                TableName: "products",
+                Item: product,
+              };
+
+              return dynamodb.put(params).promise();
+            });
+
+            await Promise.all(putPromises);
+            const responseHeaders = {
+              "Access-Control-Allow-Origin": "*", 
+              "Content-Type": "application/json", 
+            };
+
+            return {
+              statusCode: 200,
+              headers: responseHeaders,
+              body: JSON.stringify({ message: "Products uploaded successfully" }),
+            };
+          } catch (error) {
+            console.error("Failed to upload products:", error);
+            return {
+              statusCode: 500,
+              headers: { "Access-Control-Allow-Origin": "*" }, 
+              body: JSON.stringify({ message: "Failed to upload products" }),
+            };
+          }
+          };
+      Role: arn:aws:iam::723056485403:role/LabRole
+
+  mailAuth:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: mailAuth
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref snsTopic
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const sns = new AWS.SNS();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const snsTopicArn = process.env.SNS_TOPIC_ARN;
+          const userTableName = "users";
+
+          exports.handler = async (event) => {
+            try {
+           
+              const { email, password } = JSON.parse(event.body);
+
+              
+              const userParams = {
+                TableName: userTableName,
+                Key: { email: email },
+              };
+
+              const user = await dynamodb.get(userParams).promise();
+
+              if (user.Item) {
+            
+                const loginSuccessMessage = `Welcome back! You have successfully logged in.`;
+                const snsLoginSuccessParams = {
+                  Message: loginSuccessMessage,
+                  Subject: "Login Success",
+                  TopicArn: snsTopicArn,
+                  MessageAttributes: {
+                    email: {
+                      DataType: "String",
+                      StringValue: email,
+                    },
+                  },
+                };
+
+                await sns.publish(snsLoginSuccessParams).promise();
+                return {
+                  statusCode: 200,
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*", 
+                  },
+                  body: JSON.stringify({
+                    message:
+                      "Login successful. Please check your email for Welcome Message!",
+                  }),
+                };
+              } else {
+
+                const subscribeParams = {
+                  Protocol: "email",
+                  TopicArn: snsTopicArn,
+                  Endpoint: email,
+                  Attributes: {
+                    FilterPolicy: JSON.stringify({ email: [email] }),
+                  },
+                };
+
+                await sns.subscribe(subscribeParams).promise();
+
+                const userData = {
+                  email: email,
+                  password: password,
+                };
+
+                const putUserParams = {
+                  TableName: userTableName,
+                  Item: userData,
+                };
+
+                await dynamodb.put(putUserParams).promise();
+                return {
+                  statusCode: 201,
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*", 
+                  },
+                  body: JSON.stringify({
+                    message:
+                      "Signup successful. Please check your email for confirmation message.",
+                  }),
+                };
+              }
+
+            } catch (error) {
+              console.error("Error:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+      Role: arn:aws:iam::723056485403:role/LabRole
+
+  postBill:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: postBill
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref snsTopic
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+          const snsTopicArn = process.env.SNS_TOPIC_ARN;
+          const sns = new AWS.SNS();
+
+          exports.handler = async (event, context) => {
+            try {
+
+              const billId = generateRandomId();
+
+
+              const jsonPayload = JSON.parse(event.body);
+
+
+              const billItems = jsonPayload.items;
+
+              let totalBill = 0;
+
+              let itemsToUpdate = [];
+
+              for (const item of billItems) {
+                const { productId, productName, productPrice, productQuantity } = item;
+                const itemTotal = parseInt(productPrice) * parseInt(productQuantity);
+                totalBill += itemTotal;
+
+             
+                const getItemParams = {
+                  TableName: "products",
+                  Key: { productId: productId },
+                };
+                const data = await dynamoDB.get(getItemParams).promise();
+                const existingItem = data.Item;
+
+
+                const currentQuantity = parseInt(existingItem.productQuantity);
+                const updatedQuantity = currentQuantity - parseInt(productQuantity);
+
+
+                const updatedItem = {
+                  ...existingItem,
+                  productQuantity: String(updatedQuantity), // Convert the updatedQuantity to string
+                };
+                itemsToUpdate.push(updatedItem);
+
+
+                console.log("Item Details:");
+                console.log("Product ID:", productId);
+                console.log("Product Name:", productName);
+                console.log("Product Price:", productPrice);
+                console.log("Product Quantity:", productQuantity);
+                console.log("Item Total:", itemTotal);
+              }
+
+
+              const batchUpdateParams = {
+                RequestItems: {
+                  products: itemsToUpdate.map((item) => ({
+                    PutRequest: {
+                      Item: item,
+                    },
+                  })),
+                },
+              };
+
+              await dynamoDB.batchWrite(batchUpdateParams).promise();
+
+              const lowQuantityProducts = [];
+              for (const item of itemsToUpdate) {
+                const { productId, productName, productQuantity } = item;
+                const currentQuantity = parseInt(productQuantity);
+                console.log(currentQuantity);
+                if (currentQuantity < 10) {
+                  lowQuantityProducts.push(productName);
+                }
+              }
+              console.log("Products with Quantity Less than 10:", lowQuantityProducts);
+              const email = jsonPayload.email;
+              if (lowQuantityProducts.length >= 1) {
+                const lowMessage = `You have following products with low quantity - ${lowQuantityProducts}. Order it as soon as possible to keep inventory full.`;
+                const snsLoginSuccessParams = {
+                  Message: lowMessage,
+                  Subject: "LOW QUANTITY ALERT!",
+                  TopicArn: snsTopicArn,
+                  MessageAttributes: {
+                    email: {
+                      DataType: "String",
+                      StringValue: email,
+                    },
+                  },
+                };
+
+                await sns.publish(snsLoginSuccessParams).promise();
+              }
+
+
+              const billInfo = {
+                billId: billId,
+                billItems: billItems,
+                totalBill: String(totalBill),
+
+              };
+              const putBillParams = {
+                TableName: "bills",
+                Item: billInfo,
+              };
+              await dynamoDB.put(putBillParams).promise();
+
+
+              console.log("Total Bill:", totalBill);
+
+              return {
+                statusCode: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Access-Control-Allow-Origin": "*",
+                },
+                body: JSON.stringify(
+                  "Bill details logged and product quantities updated successfully."
+                ),
+              };
+            } catch (error) {
+              console.error("Error:", error);
+              return {
+                statusCode: 500,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Access-Control-Allow-Origin": "*",
+                },
+                body: JSON.stringify("Error occurred while processing the bill."),
+              };
+            }
+          };
+
+
+          function generateRandomId() {
+
+            const timestamp = Date.now();
+            const randomNum = Math.floor(Math.random() * 1000000);
+            return `${timestamp}-${randomNum}`;
+          }
+      Role: arn:aws:iam::723056485403:role/LabRole
+
+  getAllBill:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: getAllBill
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Timeout: 30
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event, context) => {
+            try {
+
+              const scanParams = {
+                TableName: "bills",
+              };
+              const data = await dynamoDB.scan(scanParams).promise();
+              const allBills = data.Items;
+
+              console.log("All Bills:", allBills);
+
+              return {
+                statusCode: 200,
+                 headers: {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*", 
+                },
+                body: JSON.stringify(allBills),
+              };
+            } catch (error) {
+              console.error("Error:", error);
+              return {
+                statusCode: 500,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*", 
+                },
+                body: JSON.stringify("Error occurred while fetching all bills."),
+              };
+            }
+          };
+      Role: arn:aws:iam::723056485403:role/LabRole
+
+  getProductsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: getProducts
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Timeout: 30
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          AWS.config.update({
+            region: "us-east-1",
+          });
+
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event) => {
+            try {
+              const params = {
+                TableName: "products",
+              };
+
+              const data = await dynamodb.scan(params).promise();
+
+              const products = data.Items.map((item) => ({
+                productId: item.productId,
+                productName: item.productName,
+                productPrice: item.productPrice,
+                productCategory: item.productCategory,
+                productQuantity: item.productQuantity,
+                productManufacturer: item.productManufacturer,
+              }));
+
+              return {
+                statusCode: 200,
+                headers: { "Access-Control-Allow-Origin": "*" },
+                body: JSON.stringify({ products }), 
+              };
+            } catch (error) {
+              console.error("Error fetching products:", error);
+
+              return {
+                statusCode: 500,
+                headers: { "Access-Control-Allow-Origin": "*" },
+                body: JSON.stringify({ message: "Failed to fetch products" }),
+              };
+            }
+          };
+      Role: arn:aws:iam::723056485403:role/LabRole
+
+  UploadPdfRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: UploadPdfRestApi
+
+  UploadPdfResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UploadPdfRestApi
+      ParentId: !GetAtt UploadPdfRestApi.RootResourceId
+      PathPart: "upload"
+
+  UploadPdfMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UploadPdfRestApi
+      ResourceId: !Ref UploadPdfResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${pdfupload.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  UploadPdfOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UploadPdfRestApi
+      ResourceId: !Ref UploadPdfResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  UploadPdfDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UploadPdfMethod
+      - UploadPdfOptionsMethod
+    Properties:
+      RestApiId: !Ref UploadPdfRestApi
+      StageName: "prod"
+
+  UploadPdfUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/apipdftextract"
+      Description: API Gateway URL for adding products.
+      Type: String
+      Value: !Sub "https://${UploadPdfRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  LambdaPermissionAddproduct:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt pdfupload.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UploadPdfRestApi}/*/*/*"
+
+  AddProductRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: AddProductRestApi
+
+  AddProductResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AddProductRestApi
+      ParentId: !GetAtt AddProductRestApi.RootResourceId
+      PathPart: addproduct
+
+  AddProductMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AddProductRestApi
+      ResourceId: !Ref AddProductResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AddProduct.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  AddProductOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AddProductRestApi
+      ResourceId: !Ref AddProductResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AddProductDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: AddProductMethod
+    Properties:
+      RestApiId: !Ref AddProductRestApi
+
+  AddProductStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn:
+      - AddProductDeployment
+      - AddProductRestApi
+    Properties:
+      StageName: prod
+      RestApiId: !Ref AddProductRestApi
+      DeploymentId: !Ref AddProductDeployment
+
+  AddProductUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/APIaddProducts"
+      Description: API Gateway URL for adding products.
+      Type: String
+      Value: !Sub "https://${AddProductRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  AddproductPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AddProduct
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AddProductRestApi}/*/POST/addproduct"
+
+  authAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: authAPI
+
+  authResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref authAPI
+      ParentId: !GetAtt authAPI.RootResourceId
+      PathPart: auth
+
+  mailAuthMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref authAPI
+      ResourceId: !Ref authResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${mailAuth.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  mailAuthOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref authAPI
+      ResourceId: !Ref authResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  authAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: mailAuthMethodPost
+    Properties:
+      RestApiId: !Ref authAPI
+
+  authAPIStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: authAPIDeployment
+    Properties:
+      StageName: prod
+      RestApiId: !Ref authAPI
+      DeploymentId: !Ref authAPIDeployment
+
+  authAPIUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/authAPI"
+      Description: API Gateway URL for authentication.
+      Type: String
+      Value: !Sub "https://${authAPI}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  MyAuthLambdaPermissionApiGateway:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref mailAuth
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${authAPI}/*/*/*"
+
+  genBill:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: genBill
+
+  genBillResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref genBill
+      ParentId: !GetAtt genBill.RootResourceId
+      PathPart: bills
+
+  genBillMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref genBill
+      ResourceId: !Ref genBillResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${postBill.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  genBillMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref genBill
+      ResourceId: !Ref genBillResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${getAllBill.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  genBillOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref genBill
+      ResourceId: !Ref genBillResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  genBillDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [genBillMethodPost, genBillMethodGet]
+    Properties:
+      RestApiId: !Ref genBill
+
+  genBillStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: genBillDeployment
+    Properties:
+      StageName: prod
+      RestApiId: !Ref genBill
+      DeploymentId: !Ref genBillDeployment
+
+  genBillUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/generatebill"
+      Description: API Gateway URL for adding products.
+      Type: String
+      Value: !Sub "https://${genBill}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  MyLambdaPermissionApiGateway:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref postBill
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${genBill}/*/*/*"
+
+  MyLambdaPermissionApiGatewayGetAll:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref getAllBill
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${genBill}/*/GET/bills"
+
+  GetProductAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: GetProductAPI
+
+  GetProductResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GetProductAPI
+      ParentId: !GetAtt GetProductAPI.RootResourceId
+      PathPart: getproducts
+
+  GetProductMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GetProductAPI
+      ResourceId: !Ref GetProductResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${getProductsFunction.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  GetProductsApiGatewayOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GetProductAPI
+      ResourceId: !Ref GetProductResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  GetProductDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: GetProductMethod
+    Properties:
+      RestApiId: !Ref GetProductAPI
+
+  GetProductApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn:
+      - GetProductDeployment
+      - GetProductAPI
+    Properties:
+      StageName: prod
+      RestApiId: !Ref GetProductAPI
+      DeploymentId: !Ref GetProductDeployment
+
+  GetProductApiGatewayUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/getProducts"
+      Description: API Gateway URL for adding products.
+      Type: String
+      Value: !Sub "https://${GetProductAPI}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  GetProductsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref getProductsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GetProductAPI}/*/GET/getproducts"
+
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref MyBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt pdfTextract.Arn
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref pdfTextract
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${MyBucketName}"
+      SourceAccount: !Ref AWS::AccountId
+
+  MyDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: products
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  usersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: users
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  snsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: emailSystem
+
+  billsDetailsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "bills"
+      AttributeDefinitions:
+        - AttributeName: billId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: billId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0f34c5ae932e6f0e4
+      InstanceType: t2.large
+      KeyName: ec2react
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          sudo su
+          yum -y install nodejs
+          yum install -y aws-cli
+          aws configure set aws_access_key_id ASIA2QWMGMQNQLDAV7LI
+          aws configure set aws_secret_access_key vuoYQ7ad80gITMXpXdNNKi9uDc75voVwnrk7Jmti
+          aws configure set aws_session_token FwoGZXIvYXdzEFoaDGJyYhf1w3bbks64viLAAcLvQG/Y6DjJDkvXfCsRqNbC2SZY6PbJyfdkiA5ZAPy508uYd4kWY7IDx52Mg1V66U+eac8m2ZBiosT7PC1nRzD5yiNiCczmqzXIpH7kMkSVKQMVK/EAu5vAfu26zT4ih4rC0x9QrOpT9oVV/cUAf25VvH7hIJlfqstB9yXK1v4iN5/2Fh3xUmOxVqKKw9x7oi+Y0FlOu1tRVG0gtpBad0pa8izcgkTTOgv6Jyt9MoOpitVSTqFdkt40Ft0BBviKeCjEwaamBjItt7ViAtNs/oGA/YNjBLI4T1snKBpDN7QhncD5vVv5mEQ65miegW8xMIFHVa07
+          echo "Starting script execution..." >> /tmp/userdata.log
+          aws s3 cp s3://react-code-ec2/app/ /home/ec2-user --recursive >> /tmp/userdata.log 2>&1
+          echo "Script execution completed." >> /tmp/userdata.log
+          cd /home/ec2-user
+          npm install
+          npm start
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the EC2 instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+Outputs:
+  ApiGatewayUrlParameter:
+    Value: !Ref genBillUrlParameter
+    Description: SSM Parameter holding the URL for the API Gateway endpoint
+
+  AuthAPIUrlParameter:
+    Value: !Ref authAPIUrlParameter
+    Description: SSM Parameter holding the URL for the AuthAPI endpoint
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt pdfTextract.Arn
+
+  BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref MyBucketName
+
+  ApiGatewayUploadUrlParameter:
+    Value: !Ref UploadPdfUrlParameter
+    Description: SSM Parameter holding the URL for the API Gateway endpoint for upload
+
+  ApiGatewayAddProductUrlParameter:
+    Value: !Ref AddProductUrlParameter
+    Description: SSM Parameter holding the URL for the API Gateway endpoint for adding products
+
+  GetAllProductApiGatewayUrlParameter:
+    Value: !Ref GetProductApiGatewayUrlParameter
+    Description: SSM Parameter holding the URL for the API Gateway endpoint
+
+  WebsiteURL:
+    Description: URL for accessing the deployed Billventory App
+    Value: !Join
+      - ""
+      - - "http://"
+        - !GetAtt EC2Instance.PublicIp
+        - ":3000"
